@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     db_user: str = "menoss_app"
     db_password: str = ""
     db_sslmode: str = "require"
-    cognito_region: str = "us-east-1"
+    cognito_region: str = "us-east-2"
     cognito_user_pool_id: str = ""
     cognito_client_id: str = ""
     db_pool_min_size: int = 1
