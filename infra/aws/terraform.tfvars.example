@@ -1,0 +1,16 @@
+aws_region = "us-east-1"
+project_name = "menoss"
+vpc_id = "vpc-REPLACE"
+public_subnet_ids = ["subnet-PUBLIC-A", "subnet-PUBLIC-B"]
+private_subnet_ids = ["subnet-PRIVATE-A", "subnet-PRIVATE-B"]
+certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/REPLACE"
+domain_name = "api.midominio.pe"
+route53_zone_id = "Z0123456789REPLACE"
+frontend_origins = ["https://inventario.midominio.pe"]
+
+database_multi_az = true
+database_instance_class = "db.t4g.medium"
+api_min_tasks = 2
+api_max_tasks = 10
+
+# Do not store passwords here; Terraform generates a runtime DB password.

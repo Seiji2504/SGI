@@ -1,0 +1,12 @@
+output "api_url" { value = "https://${var.domain_name}" }
+output "api_ecr_repository" { value = aws_ecr_repository.api.repository_url }
+output "migration_ecr_repository" { value = aws_ecr_repository.migration.repository_url }
+output "migration_task_definition" { value = aws_ecs_task_definition.migration.arn }
+output "ecs_task_security_group_id" { value = aws_security_group.tasks.id }
+output "private_subnet_ids" { value = var.private_subnet_ids }
+output "ecs_cluster_name" { value = aws_ecs_cluster.main.name }
+output "cognito_user_pool_id" { value = aws_cognito_user_pool.main.id }
+output "cognito_client_id" { value = aws_cognito_user_pool_client.web.id }
+output "database_endpoint" { value = aws_db_instance.main.address }
+output "app_database_credentials_secret_arn" { value = aws_secretsmanager_secret.db_app.arn }
+output "database_admin_secret_arn" { value = aws_db_instance.main.master_user_secret[0].secret_arn }
