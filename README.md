@@ -43,7 +43,7 @@ La plantilla está en `infra/aws/` y despliega **solo la API y su infraestructur
 3. Construye y publica las imágenes de la API y de migración con una etiqueta única (`v1` en este ejemplo). No se crea ni se sube una imagen del frontend. Sustituye `ACCOUNT_ID` por tu cuenta y conserva la misma región que Terraform:
 
    ```bash
-   REGION=us-east-1
+   REGION=us-east-2
    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
    API_REPO=$(terraform output -raw api_ecr_repository)
    MIGRATION_REPO=$(terraform output -raw migration_ecr_repository)
