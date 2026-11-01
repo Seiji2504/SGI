@@ -1,0 +1,57 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: menoss
+      POSTGRES_USER: menoss
+      POSTGRES_PASSWORD: menoss-local-password
+    ports:
+      - "5432:5432"
+    volumes:
+      - menoss-postgres:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./database/local-bootstrap.sql:/docker-entrypoint-initdb.d/002-runtime-role.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U menoss -d menoss"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./backend
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgresql://menoss_app:menoss-local-password@db:5432/menoss
+      COGNITO_REGION: ${COGNITO_REGION:-us-east-1}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-us-east-1_localplaceholder}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-localplaceholder}
+      DB_POOL_MIN_SIZE: "1"
+      DB_POOL_MAX_SIZE: "5"
+      CORS_ORIGINS: http://localhost:5173
+    ports:
+      - "8000:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        VITE_COGNITO_REGION: ${COGNITO_REGION:-us-east-1}
+        VITE_COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-localplaceholder}
+        VITE_API_URL: ""
+    environment:
+      API_UPSTREAM: api:8080
+      DNS_RESOLVER: 127.0.0.11
+    ports:
+      - "5173:8080"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  menoss-postgres:

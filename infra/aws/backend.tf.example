@@ -1,0 +1,11 @@
+# Copy this block to backend.tf and fill in an S3 bucket created beforehand.
+# Enable bucket versioning, SSE-KMS, and a DynamoDB lock table (or S3 lockfile).
+terraform {
+  backend "s3" {
+    bucket       = "REPLACE_WITH_TERRAFORM_STATE_BUCKET"
+    key          = "menoss/aws/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
