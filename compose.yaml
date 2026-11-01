@@ -24,8 +24,8 @@ services:
     environment:
       PORT: "8080"
       DATABASE_URL: postgresql://menoss_app:menoss-local-password@db:5432/menoss
-      COGNITO_REGION: ${COGNITO_REGION:-us-east-1}
-      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-us-east-1_localplaceholder}
+      COGNITO_REGION: ${COGNITO_REGION:-us-east-2}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-us-east-2_localplaceholder}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-localplaceholder}
       DB_POOL_MIN_SIZE: "1"
       DB_POOL_MAX_SIZE: "5"
@@ -41,7 +41,7 @@ services:
     build:
       context: ./frontend
       args:
-        VITE_COGNITO_REGION: ${COGNITO_REGION:-us-east-1}
+        VITE_COGNITO_REGION: ${COGNITO_REGION:-us-east-2}
         VITE_COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-localplaceholder}
         VITE_API_URL: ""
     environment:
