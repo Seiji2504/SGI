@@ -1,4 +1,4 @@
-output "api_url" { value = "https://${var.domain_name}" }
+output "api_url" { value = aws_apigatewayv2_api.main.api_endpoint }
 output "api_ecr_repository" { value = aws_ecr_repository.api.repository_url }
 output "migration_ecr_repository" { value = aws_ecr_repository.migration.repository_url }
 output "migration_task_definition" { value = aws_ecs_task_definition.migration.arn }

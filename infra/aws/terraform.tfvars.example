@@ -1,12 +1,8 @@
 aws_region = "us-east-2"
 project_name = "menoss"
 vpc_id = "vpc-REPLACE"
-public_subnet_ids = ["subnet-PUBLIC-A", "subnet-PUBLIC-B"]
 private_subnet_ids = ["subnet-PRIVATE-A", "subnet-PRIVATE-B"]
-certificate_arn = "arn:aws:acm:us-east-2:123456789012:certificate/REPLACE"
-domain_name = "api.midominio.pe"
-route53_zone_id = "Z0123456789REPLACE"
-frontend_origins = ["https://inventario.midominio.pe"]
+frontend_origins = []
 
 database_multi_az = true
 database_instance_class = "db.t4g.medium"

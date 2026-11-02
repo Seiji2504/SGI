@@ -29,9 +29,9 @@ El login y el registro locales usan el User Pool real de Cognito. Sin esos tres 
 
 ## Despliegue de referencia en AWS
 
-La plantilla está en `infra/aws/` y despliega **solo la API y su infraestructura**: ECS Fargate, ALB, ECR, RDS PostgreSQL, Cognito, Secrets Manager y CloudWatch. El frontend se aloja fuera de AWS. Requiere AWS CLI autenticado, Terraform 1.10+, Docker, `jq`, una VPC existente, dos subnets públicas, dos privadas con salida a los servicios de AWS (NAT o endpoints), un dominio alojado en Route 53 y un certificado ACM para el dominio de la API en la región del ALB. Las subnets privadas alojan ECS y RDS; el ALB recibe HTTPS y redirige HTTP a HTTPS.
+La plantilla está en `infra/aws/` y despliega **solo la API y su infraestructura**: API Gateway HTTP API, VPC Link, ALB interno, ECS Fargate, ECR, RDS PostgreSQL, Cognito, Secrets Manager y CloudWatch. El frontend se aloja fuera de AWS. API Gateway entrega la URL HTTPS pública de AWS, por lo que no hace falta comprar dominio ni configurar Route 53 o ACM. Requiere AWS CLI autenticado, Terraform 1.10+, Docker, `jq` y una VPC existente con dos subnets privadas en zonas distintas y salida a los servicios de AWS mediante NAT Gateway. ECS y RDS permanecen privados; API Gateway se conecta al ALB interno mediante VPC Link.
 
-1. Copia `infra/aws/terraform.tfvars.example` a `infra/aws/terraform.tfvars` y completa VPC, subnets, ARN ACM, dominio de la API (`api.midominio.pe`), Hosted Zone y el origen HTTPS exacto del frontend externo (`https://inventario.midominio.pe`, sin ruta ni barra final). El dominio API debe estar cubierto por el certificado ACM. Configura primero el backend state remoto: copia `backend.tf.example` como `backend.tf` y completa el bucket S3 cifrado con versionado antes de `terraform init`. El state contiene credenciales generadas.
+1. Copia `infra/aws/terraform.tfvars.example` a `infra/aws/terraform.tfvars` y completa `vpc_id` y los dos `private_subnet_ids`. Deja `frontend_origins = []` hasta que el frontend tenga URL pública. El archivo `infra/aws/backend.tf` configura el bucket S3 cifrado y con versionado para el estado de Terraform. El state contiene credenciales generadas; no lo subas al repositorio.
 2. Inicializa Terraform y crea primero los registros ECR y el User Pool para conocer el Cognito client ID:
 
    ```bash
@@ -68,19 +68,23 @@ La plantilla está en `infra/aws/` y despliega **solo la API y su infraestructur
    TASK=$(terraform output -raw migration_task_definition)
    TASK_SG=$(terraform output -raw ecs_task_security_group_id)
    SUBNETS=$(terraform output -json private_subnet_ids | jq -r 'join(",")')
-   aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE --task-definition "$TASK" \
-     --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$TASK_SG],assignPublicIp=DISABLED}"
+   TASK_ARN=$(aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE --task-definition "$TASK" \
+     --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$TASK_SG],assignPublicIp=DISABLED}" \
+     --query 'tasks[0].taskArn' --output text)
+   aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+   aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+     --query 'tasks[0].containers[0].exitCode' --output text
    ```
 
-6. La URL pública de la API aparece como output `api_url`. Comprueba `/health` y abre `/docs` para verificarla:
+6. La URL HTTPS pública de AWS para la API aparece como output `api_url`. API Gateway la enruta mediante el VPC Link al ALB interno. Comprueba `/health` y abre `/docs` para verificarla:
 
    ```bash
    terraform output -raw api_url
    ```
 
-7. En el proveedor donde alojes el frontend, configura `VITE_API_URL` con ese `api_url`, `VITE_COGNITO_REGION` con la región del User Pool y `VITE_COGNITO_CLIENT_ID` con el output `cognito_client_id`. El valor `frontend_origins` de `terraform.tfvars` debe coincidir exactamente con el dominio HTTPS del frontend. Si cambia el dominio, actualiza esa variable y aplica Terraform de nuevo.
+7. Cuando publiques el frontend, configura en ese proveedor `VITE_API_URL` con el output `api_url`, `VITE_COGNITO_REGION=us-east-2` y `VITE_COGNITO_CLIENT_ID` con el output `cognito_client_id`. Después añade el origen HTTPS exacto que te asigne el proveedor a `frontend_origins` en `terraform.tfvars` y aplica Terraform otra vez para permitir CORS.
 
-La plantilla establece dos tareas iniciales para la API, escalables por CPU hasta el límite configurado; usa RDS cifrado, backups de 14 días y Multi-AZ por defecto. Ajusta `infra/aws/terraform.tfvars` según el tráfico y el presupuesto. La plantilla no crea la VPC, subnets, NAT, dominio ni certificado ACM. No ejecutes Terraform en producción hasta revisar su plan, costos, state remoto y proceso de restauración.
+La plantilla establece dos tareas iniciales para la API, escalables por CPU hasta el límite configurado; usa RDS cifrado, backups de 14 días y Multi-AZ por defecto. Ajusta `infra/aws/terraform.tfvars` según el tráfico y el presupuesto. La plantilla no crea la VPC, subnets ni NAT. Revisa el plan y los costos antes de aplicar.
 
 Para publicar una versión posterior, construye imágenes con una etiqueta nueva (por ejemplo `v2`), súbelas a ECR y aplica Terraform con `api_image_tag` y `migration_image_tag` actualizados. ECR bloquea la sobrescritura de tags.
 
@@ -90,5 +94,5 @@ Para publicar una versión posterior, construye imágenes con una etiqueta nueva
 - La API calcula resumen y categorías en SQL; no recorre todo el catálogo en Python.
 - FastAPI verifica JWT Cognito usando JWKS cacheado; cada tarea tiene un pool DB acotado (`DB_POOL_MAX_SIZE=5`). Mantén el máximo de conexiones agregado por número máximo de tareas por debajo de la capacidad de RDS; considera RDS Proxy si ese crecimiento requiere más conexiones.
 - Crear/editar productos y registrar el stock inicial/movimientos se ejecutan en transacciones PostgreSQL. Las modificaciones concurrentes del stock bloquean la fila de detalle.
-- ECS Fargate escala automáticamente por CPU; el ALB distribuye tráfico y hace health checks; CloudWatch conserva logs 30 días.
+- API Gateway proporciona el endpoint HTTPS; el VPC Link conecta de forma privada al ALB interno, ECS escala por CPU y el ALB ejecuta health checks. CloudWatch conserva logs 30 días.
 - El modelo multi-bodega separa existencias por `warehouse_id`; memberships y RLS validan acceso y permisos en cada transacción.

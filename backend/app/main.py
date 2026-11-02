@@ -11,7 +11,7 @@ settings = get_settings()
 app = FastAPI(title="Menoss Inventario API", version="2.0.0", description="API de inventario multi-bodega de Menoss")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.origins,
+    allow_origins=["*"],  # Temporal para pruebas
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Warehouse-ID"],
