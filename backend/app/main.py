@@ -1,3 +1,5 @@
+import boto3
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg import Connection, errors
@@ -5,7 +7,7 @@ from uuid import UUID
 
 from .config import get_settings
 from .dependencies import CurrentUser, Database
-from .schemas import Movement, MovementInput, Product, ProductInput, ProductPage, WarehouseCreate, WarehouseMemberInput
+from .schemas import AccountEnrollment, Movement, MovementInput, PlatformMembershipRoleUpdate, Product, ProductInput, ProductPage, WarehouseCreate, WarehouseMemberInput, WarehouseMemberRoleUpdate
 
 settings = get_settings()
 app = FastAPI(title="Menoss Inventario API", version="2.0.0", description="API de inventario multi-bodega de Menoss")
@@ -29,9 +31,9 @@ def require_warehouse(user: dict, warehouse_id: UUID | None, db: Connection, wri
         "SELECT role FROM warehouse_member WHERE warehouse_id = %s AND user_id = %s",
         (selected, user["id"]),
     ).fetchone()
-    if not row:
+    if not row and not user.get("is_platform_admin"):
         raise HTTPException(status_code=403, detail="No tienes acceso a esta bodega")
-    if write and row["role"] == "viewer":
+    if write and row and row["role"] == "viewer":
         raise HTTPException(status_code=403, detail="Tu rol solo permite consultar esta bodega")
     db.execute("SELECT set_config('app.warehouse_id', %s, true)", (selected,))
     return selected
@@ -244,7 +246,8 @@ def create_movement(product_id: UUID, payload: MovementInput, user: CurrentUser,
 @app.get("/api/account")
 def account(user: CurrentUser, db: Database) -> dict:
     row = db.execute("SELECT full_name FROM app_user WHERE id=%s", (user["id"],)).fetchone()
-    return {"id": user["id"], "email": user["email"], "full_name": row["full_name"] if row else ""}
+    return {"id": user["id"], "email": user["email"], "full_name": row["full_name"] if row else "",
+            "role": user["role"], "is_platform_admin": user.get("is_platform_admin", False)}
 
 
 @app.patch("/api/account")
@@ -258,6 +261,14 @@ def update_account(payload: dict, user: CurrentUser, db: Database) -> dict:
 
 @app.get("/api/warehouses")
 def list_warehouses(user: CurrentUser, db: Database) -> list[dict]:
+    if user.get("is_platform_admin"):
+        return db.execute(
+            """SELECT w.id, w.name, coalesce(wm.role, 'platform_admin') AS role
+               FROM warehouse w LEFT JOIN warehouse_member wm
+                 ON wm.warehouse_id=w.id AND wm.user_id=%s
+               ORDER BY lower(w.name), w.id""",
+            (user["id"],),
+        ).fetchall()
     return db.execute(
         "SELECT w.id,w.name,wm.role FROM warehouse w JOIN warehouse_member wm ON wm.warehouse_id=w.id "
         "WHERE wm.user_id=%s ORDER BY w.created_at", (user["id"],),
@@ -266,23 +277,49 @@ def list_warehouses(user: CurrentUser, db: Database) -> list[dict]:
 
 @app.post("/api/warehouses", status_code=201)
 def create_warehouse(payload: WarehouseCreate, user: CurrentUser, db: Database) -> dict:
+    if not user.get("is_platform_admin"):
+        raise HTTPException(status_code=403, detail="Solo el administrador global puede crear bodegas")
     name = payload.name
-    with db.transaction():
-        warehouse = db.execute("INSERT INTO warehouse(name,created_by) VALUES (%s,%s) RETURNING id,name",
-                               (name, user["id"])).fetchone()
-        db.execute("INSERT INTO warehouse_member(warehouse_id,user_id,role) VALUES (%s,%s,'owner')",
-                   (warehouse["id"], user["id"]))
-    return {**warehouse, "role": "owner"}
+    warehouse = db.execute("INSERT INTO warehouse(name,created_by) VALUES (%s,%s) RETURNING id,name",
+                           (name, user["id"])).fetchone()
+    return {**warehouse, "role": "platform_admin"}
+
+
+@app.get("/api/registration/warehouses")
+def registration_warehouses(db: Database) -> list[dict]:
+    return db.execute("SELECT id,name FROM list_registration_warehouses()").fetchall()
+
+
+@app.post("/api/account/registration", status_code=201)
+def enroll_account(payload: AccountEnrollment, user: CurrentUser, db: Database) -> dict:
+    try:
+        row = db.execute(
+            "SELECT register_current_user(%s,%s) AS role",
+            (payload.warehouse_id, payload.full_name),
+        ).fetchone()
+    except errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="Esta cuenta ya pertenece a una bodega") from exc
+    except errors.NoDataFound as exc:
+        raise HTTPException(status_code=404, detail="La bodega seleccionada no existe") from exc
+    except errors.InsufficientPrivilege as exc:
+        raise HTTPException(status_code=403, detail="No se pudo completar el alta de esta cuenta") from exc
+    return {"user_id": user["id"], "warehouse_id": str(payload.warehouse_id), "role": row["role"]}
 
 
 @app.post("/api/warehouses/{warehouse_id}/members", status_code=201)
 def add_warehouse_member(warehouse_id: UUID, payload: WarehouseMemberInput, user: CurrentUser, db: Database) -> dict:
-    owner = db.execute("SELECT 1 FROM warehouse_member WHERE warehouse_id=%s AND user_id=%s AND role IN ('owner','admin')",
+    actor = db.execute("SELECT role FROM warehouse_member WHERE warehouse_id=%s AND user_id=%s",
                        (warehouse_id, user["id"])).fetchone()
-    if not owner:
+    if not user.get("is_platform_admin") and (not actor or actor["role"] not in {"owner", "admin"}):
         raise HTTPException(status_code=403, detail="Solo propietarios y administradores pueden agregar miembros")
     member_id = str(payload.user_id)
     role = payload.role
+    existing = db.execute("SELECT role FROM warehouse_member WHERE warehouse_id=%s AND user_id=%s",
+                          (warehouse_id, member_id)).fetchone()
+    if existing and existing["role"] == "owner" and not user.get("is_platform_admin"):
+        raise HTTPException(status_code=403, detail="No se puede cambiar el rol del propietario")
+    if actor and actor["role"] == "admin" and (role == "admin" or (existing and existing["role"] == "admin")):
+        raise HTTPException(status_code=403, detail="Solo el propietario puede asignar o cambiar administradores")
     try:
         db.execute("INSERT INTO warehouse_member(warehouse_id,user_id,role) VALUES (%s,%s,%s) "
                    "ON CONFLICT (warehouse_id,user_id) DO UPDATE SET role=EXCLUDED.role",
@@ -290,3 +327,183 @@ def add_warehouse_member(warehouse_id: UUID, payload: WarehouseMemberInput, user
     except errors.ForeignKeyViolation as exc:
         raise HTTPException(status_code=404, detail="La persona debe iniciar sesión al menos una vez antes de agregarla") from exc
     return {"warehouse_id": warehouse_id, "user_id": member_id, "role": role}
+
+
+@app.get("/api/warehouses/{warehouse_id}/members")
+def list_warehouse_members(warehouse_id: UUID, user: CurrentUser, db: Database) -> dict:
+    selected = require_warehouse(user, warehouse_id, db)
+    actor = db.execute(
+        "SELECT role FROM warehouse_member WHERE warehouse_id=%s AND user_id=%s",
+        (selected, user["id"]),
+    ).fetchone()
+    if not user.get("is_platform_admin") and (not actor or actor["role"] not in {"owner", "admin"}):
+        raise HTTPException(status_code=403, detail="Solo propietarios y administradores pueden ver la lista de usuarios")
+    rows = db.execute(
+        """SELECT wm.user_id, wm.role, wm.created_at, au.email, au.full_name
+           FROM warehouse_member wm JOIN app_user au ON au.id=wm.user_id
+           WHERE wm.warehouse_id=%s
+           ORDER BY CASE wm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END,
+                    lower(au.email), wm.user_id""",
+        (selected,),
+    ).fetchall()
+    return {"warehouse_id": selected, "current_role": actor["role"] if actor else "platform_admin", "members": rows}
+
+
+@app.patch("/api/warehouses/{warehouse_id}/members/{member_id}")
+def update_warehouse_member_role(
+    warehouse_id: UUID, member_id: UUID, payload: WarehouseMemberRoleUpdate, user: CurrentUser, db: Database,
+) -> dict:
+    selected = require_warehouse(user, warehouse_id, db, write=True)
+    with db.transaction():
+        actor = db.execute(
+            "SELECT role FROM warehouse_member WHERE warehouse_id=%s AND user_id=%s FOR UPDATE",
+            (selected, user["id"]),
+        ).fetchone()
+        if actor["role"] not in {"owner", "admin"}:
+            raise HTTPException(status_code=403, detail="Solo propietarios y administradores pueden cambiar permisos")
+        target = db.execute(
+            "SELECT role FROM warehouse_member WHERE warehouse_id=%s AND user_id=%s FOR UPDATE",
+            (selected, member_id),
+        ).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado en esta bodega")
+        if target["role"] == "owner":
+            raise HTTPException(status_code=403, detail="El rol de propietario no se puede cambiar desde esta pantalla")
+        if actor["role"] == "admin" and (target["role"] == "admin" or payload.role == "admin"):
+            raise HTTPException(status_code=403, detail="Solo el propietario puede asignar o cambiar administradores")
+        db.execute(
+            "UPDATE warehouse_member SET role=%s WHERE warehouse_id=%s AND user_id=%s",
+            (payload.role, selected, member_id),
+        )
+    return {"warehouse_id": selected, "user_id": str(member_id), "role": payload.role}
+
+
+@app.get("/api/admin/users")
+def list_all_users(user: CurrentUser, db: Database) -> dict:
+    if not user.get("is_platform_admin"):
+        raise HTTPException(status_code=403, detail="Solo el administrador global puede ver todas las cuentas")
+    rows = db.execute(
+        """SELECT au.id, au.email, au.full_name, au.is_active,
+                  wm.warehouse_id, w.name AS warehouse_name, wm.role, wm.created_at AS joined_at
+           FROM app_user au
+           LEFT JOIN warehouse_member wm ON wm.user_id=au.id
+           LEFT JOIN warehouse w ON w.id=wm.warehouse_id
+           ORDER BY lower(au.full_name), lower(au.email), lower(w.name), wm.warehouse_id"""
+    ).fetchall()
+    users: dict[str, dict] = {}
+    for row in rows:
+        user_id = str(row["id"])
+        item = users.setdefault(user_id, {
+            "id": user_id, "email": row["email"], "full_name": row["full_name"],
+            "is_active": row["is_active"], "memberships": [],
+        })
+        if row["warehouse_id"]:
+            item["memberships"].append({
+                "warehouse_id": str(row["warehouse_id"]), "warehouse_name": row["warehouse_name"],
+                "role": row["role"], "joined_at": row["joined_at"],
+            })
+    settings = get_settings()
+    cognito = boto3.client("cognito-idp", region_name=settings.cognito_region)
+    paginator = cognito.get_paginator("list_users")
+    for page in paginator.paginate(UserPoolId=settings.cognito_user_pool_id):
+        for cognito_user in page.get("Users", []):
+            attrs = {item["Name"]: item["Value"] for item in cognito_user.get("Attributes", [])}
+            user_id = attrs.get("sub")
+            if not user_id:
+                continue
+            db.execute(
+                """INSERT INTO app_user(id,email,full_name,is_active) VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (id) DO NOTHING""",
+                (user_id, attrs.get("email", ""), attrs.get("name", ""), cognito_user.get("Enabled", True)),
+            )
+            item = users.setdefault(user_id, {
+                "id": user_id, "email": attrs.get("email", ""), "full_name": attrs.get("name", ""),
+                "is_active": cognito_user.get("Enabled", True), "memberships": [],
+            })
+            if item.get("is_active") and not cognito_user.get("Enabled", True):
+                item["is_active"] = False
+            if not item.get("email"):
+                item["email"] = attrs.get("email", "")
+            if not item.get("full_name"):
+                item["full_name"] = attrs.get("name", "")
+    return {"users": sorted(users.values(), key=lambda item: ((item.get("full_name") or "").lower(), (item.get("email") or "").lower(), item["id"]))}
+
+
+@app.patch("/api/admin/users/{member_id}/warehouses/{warehouse_id}")
+def update_global_member_role(
+    member_id: UUID, warehouse_id: UUID, payload: PlatformMembershipRoleUpdate,
+    user: CurrentUser, db: Database,
+) -> dict:
+    if not user.get("is_platform_admin"):
+        raise HTTPException(status_code=403, detail="Solo el administrador global puede cambiar permisos globalmente")
+    with db.transaction():
+        target = db.execute(
+            "SELECT role FROM warehouse_member WHERE user_id=%s AND warehouse_id=%s FOR UPDATE",
+            (member_id, warehouse_id),
+        ).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="El usuario ya no pertenece a esa bodega")
+        if payload.role == "owner" and target["role"] != "owner":
+            db.execute(
+                "UPDATE warehouse_member SET role='admin' WHERE warehouse_id=%s AND role='owner'",
+                (warehouse_id,),
+            )
+        elif target["role"] == "owner" and payload.role != "owner":
+            owner_count = db.execute(
+                "SELECT count(*) AS n FROM warehouse_member WHERE warehouse_id=%s AND role='owner'",
+                (warehouse_id,),
+            ).fetchone()["n"]
+            if owner_count <= 1:
+                raise HTTPException(status_code=409, detail="Asigna otro propietario antes de cambiar el último propietario")
+        db.execute(
+            "UPDATE warehouse_member SET role=%s WHERE user_id=%s AND warehouse_id=%s",
+            (payload.role, member_id, warehouse_id),
+        )
+    return {"user_id": str(member_id), "warehouse_id": str(warehouse_id), "role": payload.role}
+
+
+@app.delete("/api/admin/users/{member_id}", status_code=204)
+def delete_global_user(member_id: UUID, user: CurrentUser, db: Database) -> Response:
+    if not user.get("is_platform_admin"):
+        raise HTTPException(status_code=403, detail="Solo el administrador global puede eliminar cuentas")
+    if str(member_id) == user["id"]:
+        raise HTTPException(status_code=409, detail="No puedes eliminar tu propia cuenta de administrador global")
+    target = db.execute("SELECT email, is_active FROM app_user WHERE id=%s FOR UPDATE", (member_id,)).fetchone()
+    if not target:
+        raise HTTPException(status_code=404, detail="Cuenta no encontrada")
+    if not target["email"]:
+        raise HTTPException(status_code=409, detail="La cuenta no tiene un correo Cognito asociado")
+
+    owned = db.execute(
+        "SELECT warehouse_id FROM warehouse_member WHERE user_id=%s AND role='owner'",
+        (member_id,),
+    ).fetchall()
+    for membership in owned:
+        count = db.execute(
+            "SELECT count(*) AS n FROM warehouse_member WHERE warehouse_id=%s AND role='owner'",
+            (membership["warehouse_id"],),
+        ).fetchone()["n"]
+        if count <= 1:
+            raise HTTPException(status_code=409, detail="Transfiere la propiedad de cada bodega antes de eliminar esta cuenta")
+
+    settings = get_settings()
+    cognito = boto3.client("cognito-idp", region_name=settings.cognito_region)
+    try:
+        groups = cognito.admin_list_groups_for_user(
+            UserPoolId=settings.cognito_user_pool_id, Username=target["email"],
+        ).get("Groups", [])
+        if any(group.get("GroupName") == "platform-admin" for group in groups):
+            raise HTTPException(status_code=409, detail="No se puede eliminar una cuenta de administrador global")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "UserNotFoundException":
+            raise HTTPException(status_code=502, detail="No se pudo verificar el usuario en Cognito") from exc
+
+    with db.transaction():
+        db.execute("DELETE FROM warehouse_member WHERE user_id=%s", (member_id,))
+        db.execute("UPDATE app_user SET is_active=false WHERE id=%s", (member_id,))
+    try:
+        cognito.admin_delete_user(UserPoolId=settings.cognito_user_pool_id, Username=target["email"])
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "UserNotFoundException":
+            raise HTTPException(status_code=502, detail="Se revocó el acceso a la aplicación, pero Cognito no pudo eliminar la cuenta") from exc
+    return Response(status_code=204)

@@ -86,3 +86,24 @@ class WarehouseCreate(BaseModel):
 class WarehouseMemberInput(BaseModel):
     user_id: UUID
     role: Literal["admin", "member", "viewer"] = "member"
+
+
+class WarehouseMemberRoleUpdate(BaseModel):
+    role: Literal["admin", "member", "viewer"]
+
+
+class AccountEnrollment(BaseModel):
+    warehouse_id: UUID
+    full_name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("full_name")
+    @classmethod
+    def trim_full_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("El nombre no puede quedar vacío")
+        return value
+
+
+class PlatformMembershipRoleUpdate(BaseModel):
+    role: Literal["owner", "admin", "member", "viewer"]

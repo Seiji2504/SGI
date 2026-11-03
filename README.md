@@ -22,14 +22,15 @@ El login y el registro locales usan el User Pool real de Cognito. Sin esos tres 
 - `database/schema.sql` es el esquema de PostgreSQL para AWS. Define usuarios, bodegas, membresías con roles, productos, stock y movimientos; incluye índices para búsqueda/paginación y políticas RLS que limitan cada transacción al usuario y bodega activos.
 - `database/bootstrap.sql` aplica el esquema y crea el rol SQL de runtime con permisos limitados. Se ejecuta desde una tarea efímera de ECS.
 - Cognito autentica cuentas. FastAPI verifica JWT localmente con el JWKS de Cognito cacheado durante una hora; no hace una petición a Cognito por cada API request.
-- La cuenta que inicia sesión por primera vez recibe una bodega Menoss propia. Las rutas `/api/warehouses` y `/api/warehouses/{id}/members` permiten consultar/crear bodegas y añadir cuentas existentes por su `user_id` de Cognito. Los roles `owner`, `admin`, `member` pueden modificar; `viewer` solo consulta.
+- El administrador global pertenece al grupo Cognito `platform-admin`: puede ver todas las bodegas y cuentas, crear bodegas, cambiar permisos y eliminar cuentas. La pertenencia al grupo se asigna manualmente a la cuenta principal desde AWS CLI.
+- El registro exige elegir una bodega existente. El primer usuario que se inscribe en una bodega queda como `owner`; los siguientes quedan como `member`. Las demás cuentas solo ven las bodegas donde tienen membresía. Los roles `owner`, `admin` y `member` pueden modificar inventario; `viewer` solo consulta.
 - La aplicación archiva productos al eliminarlos para conservar el historial de movimientos.
 
 `supabase/schema.sql` queda como referencia de la versión anterior. La aplicación nueva ya no depende de Supabase. Los usuarios y datos que ya existan allí no se copian automáticamente: antes del cambio productivo hay que exportarlos y migrarlos, y las cuentas deben crearse o migrarse a Cognito.
 
 ## Despliegue de referencia en AWS
 
-La plantilla está en `infra/aws/` y despliega **solo la API y su infraestructura**: API Gateway HTTP API, VPC Link, ALB interno, ECS Fargate, ECR, RDS PostgreSQL, Cognito, Secrets Manager y CloudWatch. El frontend se aloja fuera de AWS. API Gateway entrega la URL HTTPS pública de AWS, por lo que no hace falta comprar dominio ni configurar Route 53 o ACM. Requiere AWS CLI autenticado, Terraform 1.10+, Docker, `jq` y una VPC existente con dos subnets privadas en zonas distintas y salida a los servicios de AWS mediante NAT Gateway. ECS y RDS permanecen privados; API Gateway se conecta al ALB interno mediante VPC Link.
+La plantilla está en `infra/aws/` y despliega **solo la API y su infraestructura**: API Gateway HTTP API, VPC Link, ALB interno, ECS Fargate, ECR, RDS PostgreSQL, Cognito, Secrets Manager y CloudWatch. El frontend se aloja fuera de AWS. API Gateway entrega la URL HTTPS pública de AWS, por lo que no hace falta comprar dominio ni configurar Route 53 o ACM. Requiere AWS CLI autenticado, Terraform 1.10+, Docker, Python 3 y una VPC existente con dos subnets privadas en zonas distintas y salida a los servicios de AWS mediante NAT Gateway. ECS y RDS permanecen privados; API Gateway se conecta al ALB interno mediante VPC Link.
 
 1. Copia `infra/aws/terraform.tfvars.example` a `infra/aws/terraform.tfvars` y completa `vpc_id` y los dos `private_subnet_ids`. Deja `frontend_origins = []` hasta que el frontend tenga URL pública. El archivo `infra/aws/backend.tf` configura el bucket S3 cifrado y con versionado para el estado de Terraform. El state contiene credenciales generadas; no lo subas al repositorio.
 2. Inicializa Terraform y crea primero los registros ECR y el User Pool para conocer el Cognito client ID:
@@ -67,7 +68,7 @@ La plantilla está en `infra/aws/` y despliega **solo la API y su infraestructur
    CLUSTER=$(terraform output -raw ecs_cluster_name)
    TASK=$(terraform output -raw migration_task_definition)
    TASK_SG=$(terraform output -raw ecs_task_security_group_id)
-   SUBNETS=$(terraform output -json private_subnet_ids | jq -r 'join(",")')
+   SUBNETS=$(terraform output -json private_subnet_ids | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)))')
    TASK_ARN=$(aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE --task-definition "$TASK" \
      --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$TASK_SG],assignPublicIp=DISABLED}" \
      --query 'tasks[0].taskArn' --output text)
@@ -82,7 +83,13 @@ La plantilla está en `infra/aws/` y despliega **solo la API y su infraestructur
    terraform output -raw api_url
    ```
 
-7. Cuando publiques el frontend, configura en ese proveedor `VITE_API_URL` con el output `api_url`, `VITE_COGNITO_REGION=us-east-2` y `VITE_COGNITO_CLIENT_ID` con el output `cognito_client_id`. Después añade el origen HTTPS exacto que te asigne el proveedor a `frontend_origins` en `terraform.tfvars` y aplica Terraform otra vez para permitir CORS.
+7. Cuando publiques el frontend, configura en ese proveedor `VITE_API_URL` con el output `api_url`, `VITE_COGNITO_REGION` con la región de Terraform, `VITE_COGNITO_USER_POOL_ID` con el output `cognito_user_pool_id` y `VITE_COGNITO_CLIENT_ID` con el output `cognito_client_id`. El ID del User Pool es necesario tanto para registrar cuentas como para iniciar sesión. Vuelve a compilar y publicar el frontend después de guardar esas variables, porque Vite las incorpora durante la compilación. Después añade el origen HTTPS exacto que te asigne el proveedor a `frontend_origins` en `terraform.tfvars` y aplica Terraform otra vez para permitir CORS.
+
+   ```bash
+   terraform output -raw api_url
+   terraform output -raw cognito_user_pool_id
+   terraform output -raw cognito_client_id
+   ```
 
 La plantilla establece dos tareas iniciales para la API, escalables por CPU hasta el límite configurado; usa RDS cifrado, backups de 14 días y Multi-AZ por defecto. Ajusta `infra/aws/terraform.tfvars` según el tráfico y el presupuesto. La plantilla no crea la VPC, subnets ni NAT. Revisa el plan y los costos antes de aplicar.
 
@@ -96,3 +103,84 @@ Para publicar una versión posterior, construye imágenes con una etiqueta nueva
 - Crear/editar productos y registrar el stock inicial/movimientos se ejecutan en transacciones PostgreSQL. Las modificaciones concurrentes del stock bloquean la fila de detalle.
 - API Gateway proporciona el endpoint HTTPS; el VPC Link conecta de forma privada al ALB interno, ECS escala por CPU y el ALB ejecuta health checks. CloudWatch conserva logs 30 días.
 - El modelo multi-bodega separa existencias por `warehouse_id`; memberships y RLS validan acceso y permisos en cada transacción.
+
+## Actualizar el backend, la base de datos y Netlify
+
+Usa estos pasos en la máquina Linux que ya tiene AWS CLI, Docker, Terraform y acceso al estado remoto. Copia desde el equipo de desarrollo los cambios de `backend/`, `database/`, `infra/aws/` y `frontend/`. Conserva en Linux `infra/aws/terraform.tfvars`, credenciales locales y `.terraform/`; no reemplaces el estado remoto. No ejecutes `terraform force-unlock` mientras pueda existir otro proceso de Terraform en cualquiera de las máquinas.
+
+1. Confirma que no haya otro Terraform usando el estado e inicialízalo. Si `terraform output` ya funciona y el backend no cambió, no es necesario reconfigurarlo.
+
+   ```bash
+   pgrep -af 'terraform (init|plan|apply)' || true
+   cd ~/Desktop/SGI/infra/aws
+   terraform init
+   terraform validate
+   ```
+
+2. Usa una etiqueta ECR nueva. Verifica los repositorios antes de construir; ejecuta cada asignación en su propia línea para evitar que los valores queden concatenados.
+
+   ```bash
+   RELEASE=registro-bodegas-20261103-r1
+   REGION=us-east-2
+   ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+   API_REPO="$(terraform output -raw api_ecr_repository)"
+   MIGRATION_REPO="$(terraform output -raw migration_ecr_repository)"
+   printf 'API: %s\nMigración: %s\n' "$API_REPO" "$MIGRATION_REPO"
+   aws ecr get-login-password --region "$REGION" \
+     | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+   docker build -t "$API_REPO:$RELEASE" ../../backend
+   docker build -t "$MIGRATION_REPO:$RELEASE" -f ../../database/Dockerfile ../../database
+   docker push "$API_REPO:$RELEASE"
+   docker push "$MIGRATION_REPO:$RELEASE"
+   ```
+
+3. Prepara Cognito, los permisos IAM y la tarea de migración sin cambiar todavía la imagen API. Revisa el plan: no debe incluir `aws_ecs_task_definition.api` ni actualizar el servicio API.
+
+   ```bash
+   terraform plan \
+     -target=aws_cognito_user_group.platform_admin \
+     -target=aws_iam_role_policy.cognito_admin_user_management \
+     -target=aws_ecs_task_definition.migration \
+     -var="migration_image_tag=$RELEASE" -out=stage-migration.tfplan
+   terraform show stage-migration.tfplan
+   terraform apply stage-migration.tfplan
+   ```
+
+   Así el backend actual sigue atendiendo mientras se actualiza el esquema.
+
+4. Ejecuta una sola vez la tarea de migración y comprueba el código de salida `0`. Este comando usa Python para leer las subnets y no requiere instalar `jq`.
+
+   ```bash
+   CLUSTER="$(terraform output -raw ecs_cluster_name)"
+   TASK="$(terraform output -raw migration_task_definition)"
+   TASK_SG="$(terraform output -raw ecs_task_security_group_id)"
+   SUBNETS="$(terraform output -json private_subnet_ids | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)))')"
+   TASK_ARN="$(aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE --task-definition "$TASK" \
+     --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$TASK_SG],assignPublicIp=DISABLED}" \
+     --query 'tasks[0].taskArn' --output text)"
+   aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+   aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+     --query 'tasks[0].[lastStatus,stoppedReason,containers[0].exitCode,containers[0].reason]' --output table
+   ```
+
+   Si no aparece `0`, detente y revisa el motivo y el log `migration` en CloudWatch antes de desplegar el backend nuevo.
+
+5. Asigna la cuenta 1 al grupo de administrador global una sola vez, usando el correo exacto de esa cuenta Cognito. Tras desplegar la nueva API, cierra y vuelve a iniciar sesión para que Cognito emita un token con el grupo actualizado.
+
+   ```bash
+   USER_POOL_ID="$(terraform output -raw cognito_user_pool_id)"
+   aws cognito-idp admin-add-user-to-group --region "$REGION" \
+     --user-pool-id "$USER_POOL_ID" --username 'correo-de-la-cuenta-1' --group-name platform-admin
+   ```
+
+6. Con la migración completada, despliega la imagen nueva de la API y revisa el plan antes de aplicarlo.
+
+   ```bash
+   terraform plan -var="api_image_tag=$RELEASE" -var="migration_image_tag=$RELEASE" -out=release.tfplan
+   terraform show release.tfplan
+   terraform apply release.tfplan
+   ```
+
+7. En Netlify conserva y verifica `VITE_API_URL`, `VITE_COGNITO_REGION`, `VITE_COGNITO_USER_POOL_ID` y `VITE_COGNITO_CLIENT_ID`. No hay variables nuevas. Publica un nuevo deploy para compilar el frontend actualizado. El origen HTTPS exacto de Netlify debe estar en `frontend_origins` de Terraform para permitir CORS. Luego inicia sesión como cuenta 1 y comprueba la lista de bodegas y usuarios.
+
+La migración añade columnas, funciones y políticas sin borrar bodegas, productos ni movimientos. No elimines volúmenes Docker ni cambies el estado remoto de Terraform como parte de esta actualización. ECR no permite reutilizar etiquetas existentes.

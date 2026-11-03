@@ -69,39 +69,36 @@ def get_current_user(
         if claims.get("token_use") != "access" or claims.get("client_id") != settings.cognito_client_id:
             raise jwt.InvalidTokenError("Token de acceso no válido")
         user_id = claims["sub"]
-        email = claims.get("username", "")
+        email = claims.get("email") or claims.get("username", "")
+        groups = claims.get("cognito:groups", [])
+        if isinstance(groups, str):
+            groups = [groups]
+        is_platform_admin = "platform-admin" in groups
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Sesión inválida o vencida") from exc
 
     with db.transaction():
         db.execute("SELECT set_config('app.user_id', %s, true)", (user_id,))
+        db.execute("SELECT set_config('app.platform_admin', %s, true)", ("true" if is_platform_admin else "false",))
         db.execute(
             "INSERT INTO app_user (id, email) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING",
             (user_id, email),
         )
-        # The unique app_user insert serializes concurrent first-login setup;
-        # steady-state requests do not lock the profile row.
+        account_row = db.execute("SELECT is_active FROM app_user WHERE id=%s", (user_id,)).fetchone()
+        if not account_row or not account_row["is_active"]:
+            raise HTTPException(status_code=403, detail="Esta cuenta fue desactivada")
         membership = db.execute(
             "SELECT warehouse_id, role FROM warehouse_member WHERE user_id = %s "
             "ORDER BY created_at LIMIT 1",
             (user_id,),
         ).fetchone()
-        if membership is None:
-            warehouse = db.execute(
-                "INSERT INTO warehouse (name, created_by) VALUES (%s, %s) RETURNING id",
-                ("Bodega Menoss", user_id),
-            ).fetchone()
-            db.execute(
-                "INSERT INTO warehouse_member (warehouse_id, user_id, role) VALUES (%s, %s, 'owner')",
-                (warehouse["id"], user_id),
-            )
-            membership = {"warehouse_id": warehouse["id"], "role": "owner"}
-        db.execute("SELECT set_config('app.warehouse_id', %s, true)", (str(membership["warehouse_id"]),))
+        db.execute("SELECT set_config('app.warehouse_id', %s, true)", (str(membership["warehouse_id"]) if membership else "",))
     return {
         "id": user_id,
         "email": email,
-        "warehouse_id": str(membership["warehouse_id"]),
-        "role": membership["role"],
+        "warehouse_id": str(membership["warehouse_id"]) if membership else None,
+        "role": membership["role"] if membership else None,
+        "is_platform_admin": is_platform_admin,
     }
 
 

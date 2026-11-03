@@ -153,6 +153,12 @@ resource "aws_cognito_user_pool" "main" {
   }
   tags = local.common_tags
 }
+resource "aws_cognito_user_group" "platform_admin" {
+  name         = "platform-admin"
+  user_pool_id = aws_cognito_user_pool.main.id
+  description  = "Administrador global de Menoss"
+  precedence   = 0
+}
 resource "aws_cognito_user_pool_client" "web" {
   name                          = "${local.name}-web"
   user_pool_id                  = aws_cognito_user_pool.main.id
@@ -254,6 +260,18 @@ resource "aws_iam_role" "task_runtime" {
   name               = "${local.name}-ecs-runtime"
   assume_role_policy = data.aws_iam_policy_document.ecs_task_assume.json
   tags               = local.common_tags
+}
+resource "aws_iam_role_policy" "cognito_admin_user_management" {
+  name = "cognito-admin-user-management"
+  role = aws_iam_role.task_runtime.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect   = "Allow",
+      Action   = ["cognito-idp:AdminDeleteUser", "cognito-idp:AdminListGroupsForUser", "cognito-idp:ListUsers"],
+      Resource = aws_cognito_user_pool.main.arn
+    }]
+  })
 }
 resource "aws_iam_role_policy" "ecs_exec_channels" {
   name = "ecs-exec-channels"
@@ -386,7 +404,7 @@ resource "aws_ecs_service" "api" {
     container_name   = "api"
     container_port   = 8080
   }
-  depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.execution_managed, aws_iam_role_policy.read_db_secret, aws_iam_role_policy.ecs_exec_channels]
+  depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.execution_managed, aws_iam_role_policy.read_db_secret, aws_iam_role_policy.ecs_exec_channels, aws_iam_role_policy.cognito_admin_user_management]
   tags       = local.common_tags
 }
 

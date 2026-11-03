@@ -43,6 +43,7 @@ services:
       args:
         VITE_COGNITO_REGION: ${COGNITO_REGION:-us-east-2}
         VITE_COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-localplaceholder}
+        VITE_COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-us-east-2_localplaceholder}
         VITE_API_URL: ""
     environment:
       API_UPSTREAM: api:8080
