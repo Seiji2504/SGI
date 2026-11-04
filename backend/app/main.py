@@ -285,6 +285,44 @@ def create_warehouse(payload: WarehouseCreate, user: CurrentUser, db: Database) 
     return {**warehouse, "role": "platform_admin"}
 
 
+@app.patch("/api/admin/warehouses/{warehouse_id}")
+def update_global_warehouse(
+    warehouse_id: UUID, payload: WarehouseCreate, user: CurrentUser, db: Database,
+) -> dict:
+    if not user.get("is_platform_admin"):
+        raise HTTPException(status_code=403, detail="Solo el administrador global puede editar bodegas")
+    row = db.execute(
+        "UPDATE warehouse SET name=%s WHERE id=%s RETURNING id,name",
+        (payload.name, warehouse_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Bodega no encontrada")
+    return {**row, "role": "platform_admin"}
+
+
+@app.delete("/api/admin/warehouses/{warehouse_id}", status_code=204)
+def delete_global_warehouse(warehouse_id: UUID, user: CurrentUser, db: Database) -> Response:
+    if not user.get("is_platform_admin"):
+        raise HTTPException(status_code=403, detail="Solo el administrador global puede eliminar bodegas")
+    with db.transaction():
+        row = db.execute(
+            "SELECT id FROM warehouse WHERE id=%s FOR UPDATE", (warehouse_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Bodega no encontrada")
+        selected = str(warehouse_id)
+        db.execute("SELECT set_config('app.warehouse_id', %s, true)", (selected,))
+        db.execute("DELETE FROM inventory_movement WHERE warehouse_id=%s", (selected,))
+        db.execute(
+            "DELETE FROM product_detail WHERE product_id IN (SELECT id FROM product WHERE warehouse_id=%s)",
+            (selected,),
+        )
+        db.execute("DELETE FROM product WHERE warehouse_id=%s", (selected,))
+        db.execute("DELETE FROM warehouse_member WHERE warehouse_id=%s", (selected,))
+        db.execute("DELETE FROM warehouse WHERE id=%s", (selected,))
+    return Response(status_code=204)
+
+
 @app.get("/api/registration/warehouses")
 def registration_warehouses(db: Database) -> list[dict]:
     return db.execute("SELECT id,name FROM list_registration_warehouses()").fetchall()
@@ -391,6 +429,7 @@ def list_all_users(user: CurrentUser, db: Database) -> dict:
            ORDER BY lower(au.full_name), lower(au.email), lower(w.name), wm.warehouse_id"""
     ).fetchall()
     users: dict[str, dict] = {}
+    cognito_user_ids: set[str] = set()
     for row in rows:
         user_id = str(row["id"])
         item = users.setdefault(user_id, {
@@ -411,6 +450,7 @@ def list_all_users(user: CurrentUser, db: Database) -> dict:
             user_id = attrs.get("sub")
             if not user_id:
                 continue
+            cognito_user_ids.add(user_id)
             db.execute(
                 """INSERT INTO app_user(id,email,full_name,is_active) VALUES (%s,%s,%s,%s)
                    ON CONFLICT (id) DO NOTHING""",
@@ -418,15 +458,24 @@ def list_all_users(user: CurrentUser, db: Database) -> dict:
             )
             item = users.setdefault(user_id, {
                 "id": user_id, "email": attrs.get("email", ""), "full_name": attrs.get("name", ""),
-                "is_active": cognito_user.get("Enabled", True), "memberships": [],
+                "is_active": cognito_user.get("Enabled", True), "cognito_exists": True, "memberships": [],
             })
+            item["cognito_exists"] = True
             if item.get("is_active") and not cognito_user.get("Enabled", True):
                 item["is_active"] = False
             if not item.get("email"):
                 item["email"] = attrs.get("email", "")
             if not item.get("full_name"):
                 item["full_name"] = attrs.get("name", "")
-    return {"users": sorted(users.values(), key=lambda item: ((item.get("full_name") or "").lower(), (item.get("email") or "").lower(), item["id"]))}
+    visible_users = [
+        item for item in users.values()
+        if item["id"] in cognito_user_ids or item["memberships"]
+    ]
+    for item in visible_users:
+        item["cognito_exists"] = item["id"] in cognito_user_ids
+        if not item["cognito_exists"]:
+            item["is_active"] = False
+    return {"users": sorted(visible_users, key=lambda item: ((item.get("full_name") or "").lower(), (item.get("email") or "").lower(), item["id"]))}
 
 
 @app.patch("/api/admin/users/{member_id}/warehouses/{warehouse_id}")
@@ -448,13 +497,6 @@ def update_global_member_role(
                 "UPDATE warehouse_member SET role='admin' WHERE warehouse_id=%s AND role='owner'",
                 (warehouse_id,),
             )
-        elif target["role"] == "owner" and payload.role != "owner":
-            owner_count = db.execute(
-                "SELECT count(*) AS n FROM warehouse_member WHERE warehouse_id=%s AND role='owner'",
-                (warehouse_id,),
-            ).fetchone()["n"]
-            if owner_count <= 1:
-                raise HTTPException(status_code=409, detail="Asigna otro propietario antes de cambiar el último propietario")
         db.execute(
             "UPDATE warehouse_member SET role=%s WHERE user_id=%s AND warehouse_id=%s",
             (payload.role, member_id, warehouse_id),
@@ -474,18 +516,6 @@ def delete_global_user(member_id: UUID, user: CurrentUser, db: Database) -> Resp
     if not target["email"]:
         raise HTTPException(status_code=409, detail="La cuenta no tiene un correo Cognito asociado")
 
-    owned = db.execute(
-        "SELECT warehouse_id FROM warehouse_member WHERE user_id=%s AND role='owner'",
-        (member_id,),
-    ).fetchall()
-    for membership in owned:
-        count = db.execute(
-            "SELECT count(*) AS n FROM warehouse_member WHERE warehouse_id=%s AND role='owner'",
-            (membership["warehouse_id"],),
-        ).fetchone()["n"]
-        if count <= 1:
-            raise HTTPException(status_code=409, detail="Transfiere la propiedad de cada bodega antes de eliminar esta cuenta")
-
     settings = get_settings()
     cognito = boto3.client("cognito-idp", region_name=settings.cognito_region)
     try:
@@ -494,16 +524,29 @@ def delete_global_user(member_id: UUID, user: CurrentUser, db: Database) -> Resp
         ).get("Groups", [])
         if any(group.get("GroupName") == "platform-admin" for group in groups):
             raise HTTPException(status_code=409, detail="No se puede eliminar una cuenta de administrador global")
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") != "UserNotFoundException":
-            raise HTTPException(status_code=502, detail="No se pudo verificar el usuario en Cognito") from exc
-
-    with db.transaction():
-        db.execute("DELETE FROM warehouse_member WHERE user_id=%s", (member_id,))
-        db.execute("UPDATE app_user SET is_active=false WHERE id=%s", (member_id,))
-    try:
         cognito.admin_delete_user(UserPoolId=settings.cognito_user_pool_id, Username=target["email"])
     except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") != "UserNotFoundException":
-            raise HTTPException(status_code=502, detail="Se revocó el acceso a la aplicación, pero Cognito no pudo eliminar la cuenta") from exc
+        code = exc.response.get("Error", {}).get("Code")
+        if code != "UserNotFoundException":
+            if code == "AccessDeniedException":
+                raise HTTPException(status_code=502, detail="AWS negó la eliminación en Cognito. Revisa que el rol ECS tenga cognito-idp:AdminDeleteUser; no se borraron sus bodegas.") from exc
+            raise HTTPException(status_code=502, detail="Cognito no pudo eliminar la cuenta; no se borraron sus bodegas.") from exc
+
+    with db.transaction():
+        owned = db.execute(
+            "SELECT warehouse_id FROM warehouse_member WHERE user_id=%s AND role='owner'",
+            (member_id,),
+        ).fetchall()
+        for membership in owned:
+            warehouse_id = str(membership["warehouse_id"])
+            db.execute("SELECT set_config('app.warehouse_id', %s, true)", (warehouse_id,))
+            db.execute("DELETE FROM inventory_movement WHERE warehouse_id=%s", (warehouse_id,))
+            db.execute(
+                "DELETE FROM product_detail WHERE product_id IN (SELECT id FROM product WHERE warehouse_id=%s)",
+                (warehouse_id,),
+            )
+            db.execute("DELETE FROM product WHERE warehouse_id=%s", (warehouse_id,))
+            db.execute("DELETE FROM warehouse WHERE id=%s", (warehouse_id,))
+        db.execute("DELETE FROM warehouse_member WHERE user_id=%s", (member_id,))
+        db.execute("UPDATE app_user SET is_active=false WHERE id=%s", (member_id,))
     return Response(status_code=204)

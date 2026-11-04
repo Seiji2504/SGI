@@ -22,7 +22,8 @@ El login y el registro locales usan el User Pool real de Cognito. Sin esos tres 
 - `database/schema.sql` es el esquema de PostgreSQL para AWS. Define usuarios, bodegas, membresías con roles, productos, stock y movimientos; incluye índices para búsqueda/paginación y políticas RLS que limitan cada transacción al usuario y bodega activos.
 - `database/bootstrap.sql` aplica el esquema y crea el rol SQL de runtime con permisos limitados. Se ejecuta desde una tarea efímera de ECS.
 - Cognito autentica cuentas. FastAPI verifica JWT localmente con el JWKS de Cognito cacheado durante una hora; no hace una petición a Cognito por cada API request.
-- El administrador global pertenece al grupo Cognito `platform-admin`: puede ver todas las bodegas y cuentas, crear bodegas, cambiar permisos y eliminar cuentas. La pertenencia al grupo se asigna manualmente a la cuenta principal desde AWS CLI.
+- El administrador global pertenece al grupo Cognito `platform-admin`: puede ver todas las bodegas y cuentas, crear, renombrar y eliminar bodegas, cambiar permisos y eliminar cuentas desde la pantalla Cuenta y usuarios. La pertenencia al grupo se asigna manualmente a la cuenta principal desde AWS CLI.
+- Al eliminar una cuenta propietaria, el administrador global elimina también las bodegas donde esa cuenta aún figura como propietaria, junto con productos y movimientos de esas bodegas. Los demás miembros pierden acceso; el historial de bodegas restantes se conserva.
 - El registro exige elegir una bodega existente. El primer usuario que se inscribe en una bodega queda como `owner`; los siguientes quedan como `member`. Las demás cuentas solo ven las bodegas donde tienen membresía. Los roles `owner`, `admin` y `member` pueden modificar inventario; `viewer` solo consulta.
 - La aplicación archiva productos al eliminarlos para conservar el historial de movimientos.
 

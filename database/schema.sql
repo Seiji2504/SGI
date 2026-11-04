@@ -209,6 +209,8 @@ CREATE POLICY warehouse_create ON warehouse FOR INSERT
 DROP POLICY IF EXISTS warehouse_update ON warehouse;
 CREATE POLICY warehouse_update ON warehouse FOR UPDATE USING (can_manage_warehouse(id))
     WITH CHECK (can_manage_warehouse(id));
+DROP POLICY IF EXISTS warehouse_platform_admin_delete ON warehouse;
+CREATE POLICY warehouse_platform_admin_delete ON warehouse FOR DELETE USING (public.is_platform_admin());
 DROP POLICY IF EXISTS product_tenant_access ON product;
 CREATE POLICY product_tenant_access ON product USING (can_access_current_warehouse(warehouse_id))
     WITH CHECK (can_write_warehouse(warehouse_id));
